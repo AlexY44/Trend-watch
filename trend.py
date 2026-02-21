@@ -31,18 +31,26 @@ C={
     'cup':'#3fb950','cdn':'#f85149',
 }
 
+def flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch(code, period, interval):
     try:
         df = yf.download(code, period=period, interval=interval,
                          auto_adjust=True, progress=False)
-        if df is None or df.empty or len(df) < 30:
+        if df is None or df.empty:
             return None
+        df = flatten_columns(df)
         df = df.dropna(subset=['Close','Open','High','Low','Volume'])
-        cl = df['Close'].squeeze()
-        hi = df['High'].squeeze()
-        lo = df['Low'].squeeze()
-        vo = df['Volume'].squeeze()
+        if len(df) < 30:
+            return None
+        cl = df['Close']
+        hi = df['High']
+        lo = df['Low']
+        vo = df['Volume']
         df['SMA25']  = cl.rolling(25).mean()
         df['SMA75']  = cl.rolling(75).mean()
         df['SMA200'] = cl.rolling(200).mean()
@@ -96,10 +104,10 @@ def slabel(v):
     return 'BUY' if v==1 else ('SELL' if v==-1 else 'NEUTRAL')
 
 def draw_candles(ax, df):
-    op=df['Open'].squeeze().values
-    hi=df['High'].squeeze().values
-    lo=df['Low'].squeeze().values
-    cl=df['Close'].squeeze().values
+    op=df['Open'].values
+    hi=df['High'].values
+    lo=df['Low'].values
+    cl=df['Close'].values
     for i in range(len(df)):
         col=C['cup'] if cl[i]>=op[i] else C['cdn']
         ax.plot([i,i],[lo[i],hi[i]],color=col,lw=0.7,zorder=2)
@@ -132,7 +140,7 @@ def make_chart(df, title, mobile=False):
     for ax in axes[:-1]: ax.set_xticklabels([])
     axes[-1].set_xticklabels([ds[i] for i in tks],rotation=35,ha='right',
                               fontsize=5 if mobile else 6.5)
-    cv=df['Close'].squeeze().values
+    cv=df['Close'].values
     ax1=axes[0]
     draw_candles(ax1,df)
     ax1.plot(x,df['SMA25'].values, color=C['sma25'], lw=1.0,label='SMA25')
@@ -143,8 +151,8 @@ def make_chart(df, title, mobile=False):
     ax1.plot(x,df['BB_l'].values,color=C['bb'],lw=0.7,ls=':',alpha=0.8)
     bx=[df.index.get_loc(i) for i in df.index[df['sig']==1]]
     sx=[df.index.get_loc(i) for i in df.index[df['sig']==-1]]
-    by=[float(df.iloc[i]['Low'].squeeze())*0.985  for i in bx]
-    sy=[float(df.iloc[i]['High'].squeeze())*1.015 for i in sx]
+    by=[float(df['Low'].iloc[i])*0.985  for i in bx]
+    sy=[float(df['High'].iloc[i])*1.015 for i in sx]
     ms=60 if mobile else 100
     ax1.scatter(bx,by,marker='^',s=ms,color=C['buy'], zorder=6,label='BUY')
     ax1.scatter(sx,sy,marker='v',s=ms,color=C['sell'],zorder=6,label='SELL')
@@ -166,8 +174,8 @@ def make_chart(df, title, mobile=False):
     ax1.legend(loc='upper left',fontsize=5.5,framealpha=0.3,
                facecolor=C['bg'],edgecolor=C['grid'],labelcolor=C['text'])
     ax2=axes[1]
-    vc=[C['cup'] if cv[i]>=df['Open'].squeeze().values[i] else C['cdn'] for i in range(len(df))]
-    ax2.bar(x,df['Volume'].squeeze().values,color=vc,alpha=0.7,width=0.8)
+    vc=[C['cup'] if cv[i]>=df['Open'].values[i] else C['cdn'] for i in range(len(df))]
+    ax2.bar(x,df['Volume'].values,color=vc,alpha=0.7,width=0.8)
     ax2.plot(x,df['VMA'].values,color=C['sma25'],lw=0.9)
     ax2.set_ylabel('Vol',color=C['sub'],fontsize=6)
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(
@@ -291,7 +299,7 @@ if rbtn and st.session_state['code']:
         lg=st.session_state['ulog']
         lg.insert(0,{'t':res['at'][11:],'c':st.session_state['code'],
                      's':slabel(int(dr['sig'].iloc[-1])),
-                     'p':f"{float(dr['Close'].squeeze().iloc[-1]):,.1f}"})
+                     'p':f"{float(dr['Close'].iloc[-1]):,.1f}"})
         st.session_state['ulog']=lg[:30]
         st.rerun()
 
@@ -306,7 +314,7 @@ if (st.session_state['auto_on'] and st.session_state['code']
         lg=st.session_state['ulog']
         lg.insert(0,{'t':res['at'][11:],'c':st.session_state['code'],
                      's':slabel(int(dr['sig'].iloc[-1])),
-                     'p':f"{float(dr['Close'].squeeze().iloc[-1]):,.1f}"})
+                     'p':f"{float(dr['Close'].iloc[-1]):,.1f}"})
         st.session_state['ulog']=lg[:30]
     st.session_state['nxt']=time.time()+UO[st.session_state['auto_interval']]
 
@@ -330,8 +338,8 @@ code=st.session_state['code']
 per=st.session_state['period']
 inv=st.session_state['interval']
 lat=df.iloc[-1]
-cv=float(df['Close'].squeeze().iloc[-1])
-pv=float(df['Close'].squeeze().iloc[-2])
+cv=float(df['Close'].iloc[-1])
+pv=float(df['Close'].iloc[-2])
 chgp=(cv-pv)/pv*100
 chga=cv-pv
 sig=int(lat['sig'])
@@ -375,7 +383,7 @@ with t2:
         rows=[]
         for ih,rh in sd.iterrows():
             rows.append({'Date':ih.strftime('%Y/%m/%d'),'Signal':slabel(int(rh['sig'])),
-                         'Price':f"{float(df.loc[ih,'Close'].squeeze()):,.1f}",
+                         'Price':f"{float(df.loc[ih,'Close']):,.1f}",
                          'BuySc':int(rh['bsc']),'SellSc':int(rh['ssc']),
                          'RSI':round(float(rh['RSI']),1),'ADX':round(float(rh['ADX']),1),
                          'Trend':rh['trend']})
@@ -389,7 +397,6 @@ with t2:
 with t3:
     sc=['Open','High','Low','Close','Volume','SMA25','SMA75','RSI','ADX','MACD','sig','trend']
     dfs=df[[c for c in sc if c in df.columns]].tail(60).copy()
-    dfs.columns=[c if isinstance(c,str) else c[0] for c in dfs.columns]
     st.dataframe(dfs.style.format(precision=2),use_container_width=True,height=400)
 if st.session_state['auto_on'] and st.session_state['nxt']:
     rem=int(st.session_state['nxt']-time.time())
