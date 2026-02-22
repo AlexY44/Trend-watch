@@ -11,10 +11,10 @@ import streamlit as st
 import yfinance as yf
 import ta
 
-PERIODS=['1mo','3mo','6mo','1y','2y','5y','10y']
-INTERVALS=['1d','1wk','1mo']
-PL={'1mo':'1M','3mo':'3M','6mo':'6M','1y':'1Y','2y':'2Y','5y':'5Y','10y':'10Y'}
-IL={'1d':'Daily','1wk':'Weekly','1mo':'Monthly'}
+PERIODS=['2y','3y','5y','10y']
+INTERVALS=['1d','1wk']
+PL={'2y':'2Y','3y':'3Y','5y':'5Y','10y':'10Y'}
+IL={'1d':'Daily','1wk':'Weekly'}
 UO={'5min':300,'10min':600,'15min':900,'30min':1800,'1hr':3600}
 POPULAR=[
     ('1326.T','SPDR Gold'),('7203.T','Toyota'),('6758.T','Sony'),
@@ -29,6 +29,26 @@ C={
     'bb':'#388bfd','macd':'#58a6ff','msig':'#ffa657',
     'hup':'#3fb950','hdn':'#f85149','rsi':'#d2a8ff',
     'cup':'#3fb950','cdn':'#f85149',
+}
+
+DEFAULT_PARAMS={
+    'w_trend':1,'w_macd':2,
+    'rsi_buy_th':30,'rsi_sell_th':70,
+    'adx_th':25,
+    'stoch_buy_th':25,'stoch_sell_th':75,
+    'buy_th':3,'sell_th':3,
+}
+
+PARAM_GRID={
+    'w_trend':[1,2],
+    'w_macd':[1,2,3],
+    'rsi_buy_th':[25,30,35],
+    'rsi_sell_th':[65,70,75],
+    'adx_th':[20,25,30],
+    'stoch_buy_th':[20,25,30],
+    'stoch_sell_th':[70,75,80],
+    'buy_th':[2,3,4],
+    'sell_th':[2,3,4],
 }
 
 def flatten_df(df):
@@ -64,16 +84,16 @@ def compute_signals(df, p):
     sxu=(s['SK']>s['SD'])&(s['SK'].shift(1)<=s['SD'].shift(1))
     sxd=(s['SK']<s['SD'])&(s['SK'].shift(1)>=s['SD'].shift(1))
     bsc=(
-        (s['SMA25']>s['SMA75']).astype(int) * p['w_trend'] +
-        mxu.astype(int) * p['w_macd'] +
+        (s['SMA25']>s['SMA75']).astype(int)*p['w_trend'] +
+        mxu.astype(int)*p['w_macd'] +
         ((s['RSI']>p['rsi_buy_th'])&(s['RSI'].shift(1)<=p['rsi_buy_th'])).astype(int) +
         (s['Close']<=s['BB_l']*1.01).astype(int) +
         (s['ADX']>p['adx_th']).astype(int) +
         (sxu&(s['SK']<p['stoch_buy_th'])).astype(int)
     )
     ssc=(
-        (s['SMA25']<s['SMA75']).astype(int) * p['w_trend'] +
-        mxd.astype(int) * p['w_macd'] +
+        (s['SMA25']<s['SMA75']).astype(int)*p['w_trend'] +
+        mxd.astype(int)*p['w_macd'] +
         ((s['RSI']<p['rsi_sell_th'])&(s['RSI'].shift(1)>=p['rsi_sell_th'])).astype(int) +
         (s['Close']>=s['BB_u']*0.99).astype(int) +
         (s['ADX']>p['adx_th']).astype(int) +
@@ -88,14 +108,6 @@ def compute_signals(df, p):
     df.loc[(s['SMA25']<s['SMA75'])&(s['SMA75']<s['SMA200'])&(s['ADX']>20),'trend']='Down'
     return df
 
-DEFAULT_PARAMS={
-    'w_trend':1,'w_macd':2,
-    'rsi_buy_th':30,'rsi_sell_th':70,
-    'adx_th':25,
-    'stoch_buy_th':25,'stoch_sell_th':75,
-    'buy_th':3,'sell_th':3,
-}
-
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_raw(code, period, interval):
     try:
@@ -104,9 +116,9 @@ def fetch_raw(code, period, interval):
         if df is None or df.empty: return None
         df=flatten_df(df)
         df=df.dropna(subset=['Close','Open','High','Low','Volume'])
-        if len(df)<60: return None
+        if len(df)<120: return None
         return df
-    except Exception as e:
+    except:
         return None
 
 def run_backtest(df, cost=0.001):
@@ -124,13 +136,13 @@ def run_backtest(df, cost=0.001):
                            'result':'Win' if ret>0 else 'Loss'})
             pos=0
         equity.append(eq)
-    if len(trades)<3: return None
+    if len(trades)<2: return None
     eq_s=pd.Series(equity,index=dates)
     bh=(cl[-1]-cl[0])/cl[0]*100
     wins=[t for t in trades if t['ret']>0]
     loss=[t for t in trades if t['ret']<=0]
     n=len(trades)
-    wr=len(wins)/n*100
+    wr=len(wins)/n*100 if n>0 else 0
     aw=np.mean([t['ret'] for t in wins]) if wins else 0
     al=np.mean([t['ret'] for t in loss]) if loss else 0
     pf=abs(sum(t['ret'] for t in wins)/sum(t['ret'] for t in loss)) if loss else 999.0
@@ -141,62 +153,109 @@ def run_backtest(df, cost=0.001):
     cagr=((eq)**(1/yrs)-1)*100 if yrs>0 else 0
     dr=eq_s.pct_change().dropna()
     sharpe=dr.mean()/dr.std()*np.sqrt(252) if dr.std()>0 else 0
-    sr=(eq-1)*100
     return {'trades':trades,'equity':eq_s,'drawdown':dd,
             'stats':{'n':n,'wr':wr,'aw':aw,'al':al,'pf':pf,
-                     'sr':sr,'bh':bh,'mdd':mdd,'cagr':cagr,'sharpe':sharpe}}
+                     'sr':(eq-1)*100,'bh':bh,'mdd':mdd,'cagr':cagr,'sharpe':sharpe}}
+
+def score_params(df, p, cost):
+    df2=compute_signals(df,p)
+    bt=run_backtest(df2,cost)
+    if bt is None: return -999
+    s=bt['stats']
+    return s['sr'] - max(0,-s['mdd'])*0.5 + s['sharpe']*3
 
 @st.cache_data(ttl=300, show_spinner=False)
-def grid_search(code, period, interval, cost=0.001):
+def walk_forward_optimize(code, period, interval, n_splits=4, cost=0.001):
     raw=fetch_raw(code,period,interval)
     if raw is None: return None
     base=compute_indicators(raw.copy())
 
-    param_grid={
-        'w_trend':[1,2],
-        'w_macd':[1,2,3],
-        'rsi_buy_th':[25,30,35],
-        'rsi_sell_th':[65,70,75],
-        'adx_th':[20,25,30],
-        'stoch_buy_th':[20,25,30],
-        'stoch_sell_th':[70,75,80],
-        'buy_th':[2,3,4],
-        'sell_th':[2,3,4],
-    }
-
-    keys=list(param_grid.keys())
-    vals=list(param_grid.values())
+    keys=list(PARAM_GRID.keys())
+    vals=list(PARAM_GRID.values())
     combos=list(itertools.product(*vals))
+    all_params=[dict(zip(keys,c)) for c in combos]
 
-    best_score=-999
-    best_params=None
-    best_bt=None
-    results=[]
+    n=len(base)
+    split_size=n//(n_splits+1)
 
-    for combo in combos:
-        p=dict(zip(keys,combo))
-        try:
-            df=compute_signals(base.copy(),p)
-            bt=run_backtest(df,cost)
-            if bt is None: continue
-            s=bt['stats']
-            score=s['sr']-max(0,-s['mdd'])*0.3+s['sharpe']*5
-            results.append({**p,'score':score,'sr':s['sr'],'bh':s['bh'],
-                            'cagr':s['cagr'],'sharpe':s['sharpe'],'mdd':s['mdd'],
-                            'wr':s['wr'],'n':s['n']})
-            if score>best_score:
-                best_score=score
-                best_params=p
-                best_bt=bt
-        except:
+    fold_results=[]
+    param_scores={i:[] for i in range(len(all_params))}
+
+    progress=st.progress(0,'Walk-forward optimization...')
+
+    for fold in range(n_splits):
+        train_end=(fold+1)*split_size
+        test_start=train_end
+        test_end=test_start+split_size
+
+        train=base.iloc[:train_end].copy()
+        test =base.iloc[test_start:test_end].copy()
+
+        if len(train)<60 or len(test)<30:
             continue
 
-    if best_params is None: return None
-    res_df=pd.DataFrame(results).sort_values('score',ascending=False)
-    return {'best_params':best_params,'best_bt':best_bt,
-            'results':res_df,'base':base}
+        best_score_fold=-999
+        best_idx_fold=0
+        for idx,p in enumerate(all_params):
+            try:
+                s=score_params(train,p,cost)
+                if s>best_score_fold:
+                    best_score_fold=s
+                    best_idx_fold=idx
+            except:
+                continue
 
-def make_bt_chart(bt, title):
+        best_p=all_params[best_idx_fold]
+        test_score=score_params(test,best_p,cost)
+
+        test_df=compute_signals(test.copy(),best_p)
+        test_bt=run_backtest(test_df,cost)
+
+        fold_results.append({
+            'fold':fold+1,
+            'train_start':base.index[0].strftime('%Y/%m'),
+            'train_end':base.index[train_end-1].strftime('%Y/%m'),
+            'test_start':base.index[test_start].strftime('%Y/%m'),
+            'test_end':base.index[min(test_end-1,n-1)].strftime('%Y/%m'),
+            'best_params':best_p,
+            'test_score':test_score,
+            'test_bt':test_bt,
+        })
+
+        for idx,p in enumerate(all_params):
+            try:
+                param_scores[idx].append(score_params(test,p,cost))
+            except:
+                param_scores[idx].append(-999)
+
+        progress.progress((fold+1)/n_splits,f'Fold {fold+1}/{n_splits} done')
+
+    progress.empty()
+
+    stable_scores={idx:np.mean([s for s in scores if s>-999])
+                   for idx,scores in param_scores.items()
+                   if any(s>-999 for s in scores)}
+
+    if not stable_scores:
+        return None
+
+    best_stable_idx=max(stable_scores,key=lambda x:stable_scores[x])
+    best_stable_params=all_params[best_stable_idx]
+
+    full_df=compute_signals(base.copy(),best_stable_params)
+    full_bt=run_backtest(full_df,cost)
+    default_df=compute_signals(base.copy(),DEFAULT_PARAMS)
+    default_bt=run_backtest(default_df,cost)
+
+    return {
+        'best_params':best_stable_params,
+        'full_bt':full_bt,
+        'default_bt':default_bt,
+        'fold_results':fold_results,
+        'base':base,
+    }
+
+def make_bt_chart(bt, title, bt2=None, label2='Buy&Hold'):
     eq=bt['equity']; dd=bt['drawdown']; trades=bt['trades']
     fig,axes=plt.subplots(2,1,figsize=(14,8),facecolor=C['bg'],
                            gridspec_kw={'height_ratios':[3,1],'hspace':0.06})
@@ -208,12 +267,16 @@ def make_bt_chart(bt, title):
     fig.suptitle(title,fontsize=11,color=C['text'],fontweight='bold',x=0.02,ha='left',y=0.99)
     ax1,ax2=axes
     bh_vals=np.linspace(1.0,1+bt['stats']['bh']/100,len(eq))
-    ax1.plot(eq.index,eq.values,color=C['buy'],lw=2.0,label='Strategy',zorder=3)
-    ax1.plot(eq.index,bh_vals,color=C['sub'],lw=1.3,ls='--',label='Buy&Hold',zorder=2)
+    ax1.plot(eq.index,eq.values,color=C['buy'],lw=2.0,label='Optimized Strategy',zorder=3)
+    if bt2 is not None:
+        eq2=bt2['equity']
+        bh2=np.linspace(1.0,1+bt2['stats']['bh']/100,len(eq2))
+        ax1.plot(eq2.index,eq2.values,color='#ffa657',lw=1.5,ls='-.',label='Default Strategy',zorder=2)
+    ax1.plot(eq.index,bh_vals,color=C['sub'],lw=1.3,ls='--',label='Buy&Hold',zorder=1)
     ax1.axhline(1.0,color=C['grid'],lw=0.8)
     for t in trades:
         col=C['buy'] if t['ret']>0 else C['sell']
-        ax1.axvline(t['entry_date'],color=col,lw=0.4,alpha=0.35)
+        ax1.axvline(t['entry_date'],color=col,lw=0.4,alpha=0.25)
     ax1.set_ylabel('Equity',color=C['sub'],fontsize=9)
     ax1.legend(loc='upper left',fontsize=8,framealpha=0.3,
                facecolor=C['bg'],edgecolor=C['grid'],labelcolor=C['text'])
@@ -222,6 +285,42 @@ def make_bt_chart(bt, title):
     ax2.plot(dd.index,dd.values,color=C['sell'],lw=0.9)
     ax2.axhline(0,color=C['grid'],lw=0.8)
     ax2.set_ylabel('Drawdown%',color=C['sub'],fontsize=9)
+    plt.close('all')
+    return fig
+
+def make_fold_chart(fold_results):
+    n=len(fold_results)
+    if n==0: return None
+    fig,ax=plt.subplots(figsize=(12,4),facecolor=C['bg'])
+    ax.set_facecolor(C['panel'])
+    ax.tick_params(colors=C['sub'],labelsize=8)
+    for sp in ax.spines.values(): sp.set_edgecolor(C['grid'])
+    ax.grid(axis='y',color=C['grid'],lw=0.5,ls='--',alpha=0.6)
+    labels=[f"Fold{r['fold']}\n{r['test_start']}" for r in fold_results]
+    srs=[]
+    bhs=[]
+    for r in fold_results:
+        bt=r['test_bt']
+        if bt:
+            srs.append(bt['stats']['sr'])
+            bhs.append(bt['stats']['bh'])
+        else:
+            srs.append(0); bhs.append(0)
+    x=np.arange(n)
+    w=0.35
+    bars1=ax.bar(x-w/2,srs,width=w,label='Strategy',
+                 color=[C['buy'] if s>=0 else C['sell'] for s in srs],alpha=0.85)
+    bars2=ax.bar(x+w/2,bhs,width=w,label='Buy&Hold',color=C['sub'],alpha=0.6)
+    ax.axhline(0,color=C['grid'],lw=1.0)
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel('Return %',color=C['sub'],fontsize=9)
+    ax.set_title('Walk-Forward Test: Strategy vs Buy&Hold per Period',
+                 color=C['text'],fontsize=10,fontweight='bold')
+    ax.legend(fontsize=8,framealpha=0.3,facecolor=C['bg'],
+              edgecolor=C['grid'],labelcolor=C['text'])
+    for bar,val in zip(bars1,srs):
+        ax.text(bar.get_x()+bar.get_width()/2,bar.get_height()+0.5,
+                f'{val:.1f}%',ha='center',va='bottom',fontsize=7,color=C['text'])
     plt.close('all')
     return fig
 
@@ -304,8 +403,7 @@ def make_chart(df,title,mobile=False):
     ax3.bar(x,hist,color=[C['hup'] if h>=0 else C['hdn'] for h in hist],alpha=0.8,width=0.8)
     ax3.plot(x,df['MACD'].values,color=C['macd'],lw=1.0,label='MACD')
     ax3.plot(x,df['MSIG'].values,color=C['msig'],lw=0.9,ls='--',label='Sig')
-    ax3.axhline(0,color=C['grid'],lw=0.7)
-    ax3.set_ylabel('MACD',color=C['sub'],fontsize=6)
+    ax3.axhline(0,color=C['grid'],lw=0.7); ax3.set_ylabel('MACD',color=C['sub'],fontsize=6)
     ax3.legend(loc='upper left',fontsize=5.5,framealpha=0.2,
                facecolor=C['bg'],edgecolor='none',labelcolor=C['text'])
     ax4=axes[3]
@@ -349,15 +447,16 @@ section[data-testid="stSidebar"]{background:#161b22!important;}
 h1,h2,h3{color:#e6edf3!important;}hr{border-color:#21262d;}
 </style>''',unsafe_allow_html=True)
 
-for k,v in [('result',None),('raw_df',None),('code',''),('period','2y'),('interval','1d'),
+for k,v in [('result',None),('code',''),('period','5y'),('interval','1d'),
             ('auto_on',False),('auto_interval','15min'),('ulog',[]),('nxt',None),
-            ('opt_result',None),('use_opt',False),('active_params',None)]:
+            ('wf_result',None),('use_opt',False),('active_params',DEFAULT_PARAMS)]:
     if k not in st.session_state: st.session_state[k]=v
 
 with st.sidebar:
     st.markdown('### Settings')
-    period  =st.selectbox('Period',  PERIODS,  index=4,format_func=lambda x:PL[x])
+    period  =st.selectbox('Period',  PERIODS,  index=2,format_func=lambda x:PL[x])
     interval=st.selectbox('Interval',INTERVALS,index=0,format_func=lambda x:IL[x])
+    st.caption('Tip: Use 5Y+ for better optimization')
     st.divider()
     st.markdown('### Auto-Update')
     aint=st.selectbox('Every',list(UO.keys()),index=2,disabled=st.session_state['auto_on'])
@@ -374,13 +473,14 @@ with st.sidebar:
         st.success(f"Every {st.session_state['auto_interval']}")
     else:
         st.caption('Stopped')
-    if st.session_state['ulog']:
-        st.divider(); st.markdown('### Log')
-        for e in st.session_state['ulog'][:6]:
-            col='#3fb950' if e['s']=='BUY' else ('#f85149' if e['s']=='SELL' else '#58a6ff')
-            st.markdown(f"<small><span style='color:#8b949e'>{e['t']}</span> "
-                        f"<b>{e['c']}</b> <span style='color:{col}'>{e['s']}</span> "
-                        f"{e['p']}</small>",unsafe_allow_html=True)
+
+def do_fetch(code, period, interval, params=None):
+    raw=fetch_raw(code,period,interval)
+    if raw is None: return None
+    p=params or DEFAULT_PARAMS
+    df=compute_indicators(raw.copy())
+    df=compute_signals(df,p)
+    return {'df':df,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
 
 st.markdown('# Trend Signal Analyzer')
 i1,i2,i3=st.columns([4,1,1])
@@ -393,33 +493,24 @@ with i2:
 with i3:
     rbtn=st.button('Refresh',use_container_width=True,disabled=not st.session_state['code'])
 
-def do_fetch(code, period, interval, params=None):
-    raw=fetch_raw(code,period,interval)
-    if raw is None: return None
-    p=params if params else DEFAULT_PARAMS
-    df=compute_indicators(raw.copy())
-    df=compute_signals(df,p)
-    return {'df':df,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
-
 if fbtn and typed.strip():
     code=typed.strip().upper()
-    fetch_raw.clear(); grid_search.clear()
-    st.session_state.update({'opt_result':None,'use_opt':False,'active_params':None})
-    params=st.session_state.get('active_params') or DEFAULT_PARAMS
+    fetch_raw.clear(); walk_forward_optimize.clear()
+    st.session_state.update({'wf_result':None,'use_opt':False,
+                             'active_params':DEFAULT_PARAMS})
     with st.spinner(f'Fetching {code}...'):
-        res=do_fetch(code,period,interval,params)
+        res=do_fetch(code,period,interval,DEFAULT_PARAMS)
     if res:
         st.session_state.update({'result':res,'code':code,'period':period,'interval':interval})
         st.rerun()
     else:
-        st.error('Failed to fetch data. Check ticker code.')
+        st.error('Failed. Check ticker or try longer period.')
 
 if rbtn and st.session_state['code']:
     fetch_raw.clear()
-    params=st.session_state.get('active_params') or DEFAULT_PARAMS
     with st.spinner('Refreshing...'):
         res=do_fetch(st.session_state['code'],st.session_state['period'],
-                     st.session_state['interval'],params)
+                     st.session_state['interval'],st.session_state['active_params'])
     if res:
         st.session_state['result']=res; dr=res['df']
         lg=st.session_state['ulog']
@@ -431,10 +522,9 @@ if rbtn and st.session_state['code']:
 if (st.session_state['auto_on'] and st.session_state['code']
         and st.session_state['nxt'] and time.time()>=st.session_state['nxt']):
     fetch_raw.clear()
-    params=st.session_state.get('active_params') or DEFAULT_PARAMS
     with st.spinner('Auto-updating...'):
         res=do_fetch(st.session_state['code'],st.session_state['period'],
-                     st.session_state['interval'],params)
+                     st.session_state['interval'],st.session_state['active_params'])
     if res:
         st.session_state['result']=res; dr=res['df']
         lg=st.session_state['ulog']
@@ -453,9 +543,9 @@ if result is None:
         if cols[i%5].button(n,key=f'h{c}',use_container_width=True):
             fetch_raw.clear()
             with st.spinner(f'Fetching {n}...'):
-                res=do_fetch(c,'2y','1d',DEFAULT_PARAMS)
+                res=do_fetch(c,'5y','1d',DEFAULT_PARAMS)
             if res:
-                st.session_state.update({'result':res,'code':c,'period':'2y','interval':'1d',
+                st.session_state.update({'result':res,'code':c,'period':'5y','interval':'1d',
                                          'active_params':DEFAULT_PARAMS})
                 st.rerun()
     st.stop()
@@ -466,9 +556,8 @@ lat=df.iloc[-1]
 cv=float(df['Close'].iloc[-1]); pv=float(df['Close'].iloc[-2])
 chgp=(cv-pv)/pv*100; chga=cv-pv
 sig=int(lat['sig']); trend=lat['trend']; fat=result['at']
+opt_label=' [Optimized]' if st.session_state['use_opt'] else ''
 
-using_opt=st.session_state.get('use_opt',False)
-opt_label=' (Optimized)' if using_opt else ' (Default)'
 st.markdown(f"### {code}  {PL[per]}/{IL[inv]}{opt_label}  <span class='ut'>Updated: {fat}</span>",
             unsafe_allow_html=True)
 sm={1:('bb','BUY Signal'),-1:('bs','SELL Signal'),0:('bn','NEUTRAL')}
@@ -493,27 +582,24 @@ m7.metric('SMA25',f"{float(lat['SMA25']):.1f}")
 m8.metric('BBWidth',f"{float(lat['BB_w']):.4f}")
 st.divider()
 
-tab1,tab2,tab3,tab4,tab5=st.tabs(['Chart','Backtest','Optimize','Signals','Data'])
+tab1,tab2,tab3,tab4=st.tabs(['Chart','Backtest','Walk-Forward Optimize','Signals'])
 
 with tab1:
     mob=st.toggle('Mobile view',value=False)
     with st.spinner('Rendering...'):
-        fig=make_chart(df,f"{code} {PL[per]}/{IL[inv]} ({len(df)} bars)",mobile=mob)
+        fig=make_chart(df,f"{code} {PL[per]}/{IL[inv]} ({len(df)} bars){opt_label}",mobile=mob)
         st.pyplot(fig,use_container_width=True)
 
 with tab2:
     st.markdown('### Backtest')
-    st.caption('Buy signal next bar -> hold -> Sell signal next bar -> repeat')
     cost_pct=st.slider('Transaction cost per side (%)',0.0,1.0,0.1,0.05,key='bt_cost')
     bt=run_backtest(df,cost=cost_pct/100)
     if bt is None:
-        st.warning('Not enough trades. Try longer period (2Y+ recommended).')
+        st.warning('Not enough trades. Try longer period.')
     else:
-        s=bt['stats']
-        diff=s['sr']-s['bh']
+        s=bt['stats']; diff=s['sr']-s['bh']
         c1,c2,c3,c4=st.columns(4)
-        c1.metric('Strategy Return',f"{s['sr']:+.1f}%",
-                  f"{diff:+.1f}% vs BuyHold",
+        c1.metric('Strategy Return',f"{s['sr']:+.1f}%",f"{diff:+.1f}% vs BuyHold",
                   delta_color='normal' if diff>=0 else 'inverse')
         c2.metric('CAGR',f"{s['cagr']:+.1f}%")
         c3.metric('Max Drawdown',f"{s['mdd']:.1f}%")
@@ -523,11 +609,9 @@ with tab2:
         c6.metric('Win Rate',f"{s['wr']:.1f}%")
         c7.metric('Avg Win',f"{s['aw']:+.2f}%")
         c8.metric('Avg Loss',f"{s['al']:+.2f}%")
-        pf_str=f"{s['pf']:.2f}" if s['pf']<999 else 'inf'
-        st.metric('Profit Factor',pf_str)
         st.divider()
-        with st.spinner('Drawing equity curve...'):
-            fig2=make_bt_chart(bt,f"{code} Backtest  {PL[per]}  cost={cost_pct}%/side{opt_label}")
+        with st.spinner('Rendering chart...'):
+            fig2=make_bt_chart(bt,f"{code} Backtest {PL[per]} cost={cost_pct}%{opt_label}")
             st.pyplot(fig2,use_container_width=True)
         st.markdown('#### Trade List')
         tdf=pd.DataFrame(bt['trades'])
@@ -536,85 +620,107 @@ with tab2:
         tdf['entry']=tdf['entry'].round(1); tdf['exit']=tdf['exit'].round(1)
         tdf['ret']=tdf['ret'].round(2)
         tdf.columns=['Entry','Exit','Buy Price','Sell Price','Return%','Result']
-        st.dataframe(tdf.iloc[::-1].reset_index(drop=True),use_container_width=True,height=350)
+        st.dataframe(tdf.iloc[::-1].reset_index(drop=True),use_container_width=True,height=300)
 
 with tab3:
-    st.markdown('### Parameter Optimization')
-    st.caption('Grid search across signal parameters to maximize risk-adjusted return vs Buy&Hold.')
-    st.info('Searches ~1,000+ parameter combinations. Takes 20-60 seconds.')
+    st.markdown('### Walk-Forward Optimization')
+    st.markdown('''
+Prevents overfitting by splitting data into multiple train/test windows.
+Parameters are optimized on each training window and evaluated on the **unseen** test window.
+The parameter set that performs consistently across **all test periods** is selected.
+    ''')
+    n_splits=st.slider('Number of test periods',2,6,4,key='n_splits')
     cost_opt=st.slider('Transaction cost (%)',0.0,1.0,0.1,0.05,key='opt_cost')
+    st.caption(f'Data will be split into {n_splits} train+test windows.')
 
-    if st.button('Run Optimization', type='primary', use_container_width=True):
-        grid_search.clear()
-        with st.spinner('Running grid search... please wait (up to 60s)'):
-            opt=grid_search(st.session_state['code'],
-                            st.session_state['period'],
-                            st.session_state['interval'],
-                            cost=cost_opt/100)
-        if opt is None:
-            st.error('Optimization failed. Try a longer period.')
-        else:
-            st.session_state['opt_result']=opt
-            st.success('Optimization complete!')
+    if st.button('Run Walk-Forward Optimization', type='primary', use_container_width=True):
+        walk_forward_optimize.clear()
+        with st.spinner(f'Running walk-forward across {n_splits} periods... (1-2 min)'):
+            wf=walk_forward_optimize(st.session_state['code'],
+                                     st.session_state['period'],
+                                     st.session_state['interval'],
+                                     n_splits=n_splits,
+                                     cost=cost_opt/100)
+        st.session_state['wf_result']=wf
+        if wf: st.success('Done! Scroll down to see results.')
+        else:   st.error('Failed. Try a longer period (5Y+).')
 
-    opt=st.session_state.get('opt_result')
-    if opt:
-        bp=opt['best_params']; bs_bt=opt['best_bt']; s=bs_bt['stats']
-        diff=s['sr']-s['bh']
-
-        st.markdown('#### Best Parameters Found')
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric('Strategy Return',f"{s['sr']:+.1f}%",
-                  f"{diff:+.1f}% vs BuyHold",
-                  delta_color='normal' if diff>=0 else 'inverse')
-        c2.metric('CAGR',f"{s['cagr']:+.1f}%")
-        c3.metric('Max Drawdown',f"{s['mdd']:.1f}%")
-        c4.metric('Sharpe',f"{s['sharpe']:.2f}")
-
-        st.markdown('**Optimized parameter values:**')
-        param_cols=st.columns(3)
-        param_items=list(bp.items())
-        for i,(k,v) in enumerate(param_items):
-            def_v=DEFAULT_PARAMS[k]
-            delta=f"(default: {def_v})" if v!=def_v else '(unchanged)'
-            param_cols[i%3].metric(k,str(v),delta)
-
-        if st.button('Apply Optimized Parameters', type='primary', use_container_width=True):
-            st.session_state['active_params']=bp
-            st.session_state['use_opt']=True
-            fetch_raw.clear()
-            raw=fetch_raw(st.session_state['code'],
-                          st.session_state['period'],
-                          st.session_state['interval'])
-            if raw is not None:
-                dfo=compute_indicators(raw.copy())
-                dfo=compute_signals(dfo,bp)
-                st.session_state['result']={'df':dfo,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
-            st.rerun()
-
-        if st.button('Reset to Default Parameters',use_container_width=True):
-            st.session_state['active_params']=DEFAULT_PARAMS
-            st.session_state['use_opt']=False
-            fetch_raw.clear()
-            raw=fetch_raw(st.session_state['code'],
-                          st.session_state['period'],
-                          st.session_state['interval'])
-            if raw is not None:
-                dfo=compute_indicators(raw.copy())
-                dfo=compute_signals(dfo,DEFAULT_PARAMS)
-                st.session_state['result']={'df':dfo,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
-            st.rerun()
+    wf=st.session_state.get('wf_result')
+    if wf:
+        bp=wf['best_params']; full_bt=wf['full_bt']; def_bt=wf['default_bt']
+        fold_results=wf['fold_results']
 
         st.divider()
-        with st.spinner('Drawing optimized equity curve...'):
-            fig3=make_bt_chart(bs_bt,f"{code} OPTIMIZED  {PL[per]}  cost={cost_opt}%/side")
-            st.pyplot(fig3,use_container_width=True)
+        st.markdown('#### Per-Period Results (Test Windows)')
+        fc=make_fold_chart(fold_results)
+        if fc: st.pyplot(fc,use_container_width=True)
 
-        st.markdown('#### Top 20 Parameter Combinations')
-        show_cols=['score','sr','bh','cagr','sharpe','mdd','wr','n',
-                   'buy_th','sell_th','w_macd','adx_th','rsi_buy_th','rsi_sell_th']
-        rdf=opt['results'][show_cols].head(20).round(2)
-        st.dataframe(rdf,use_container_width=True,height=350)
+        fold_rows=[]
+        for r in fold_results:
+            bt_r=r['test_bt']
+            fold_rows.append({
+                'Period': f"{r['test_start']} - {r['test_end']}",
+                'Strategy%': round(bt_r['stats']['sr'],1) if bt_r else 0,
+                'BuyHold%':  round(bt_r['stats']['bh'],1) if bt_r else 0,
+                'Sharpe':    round(bt_r['stats']['sharpe'],2) if bt_r else 0,
+                'Trades':    bt_r['stats']['n'] if bt_r else 0,
+                'WinRate%':  round(bt_r['stats']['wr'],1) if bt_r else 0,
+            })
+        fdf=pd.DataFrame(fold_rows)
+        st.dataframe(fdf,use_container_width=True)
+
+        beat_count=sum(1 for r in fold_rows if r['Strategy%']>r['BuyHold%'])
+        total=len(fold_rows)
+        beat_color='#3fb950' if beat_count>total/2 else '#f85149'
+        st.markdown(f"<b style='color:{beat_color}'>Beat Buy&Hold in {beat_count}/{total} test periods</b>",
+                    unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown('#### Full-Period Comparison (Optimized vs Default vs Buy&Hold)')
+        if full_bt and def_bt:
+            s=full_bt['stats']; sd=def_bt['stats']
+            c1,c2,c3=st.columns(3)
+            c1.metric('Optimized Return',f"{s['sr']:+.1f}%",f"Sharpe {s['sharpe']:.2f}")
+            c2.metric('Default Return',  f"{sd['sr']:+.1f}%",f"Sharpe {sd['sharpe']:.2f}")
+            c3.metric('Buy&Hold',        f"{s['bh']:+.1f}%")
+            with st.spinner('Rendering comparison chart...'):
+                fig3=make_bt_chart(full_bt,
+                                   f"{code} Full Period: Optimized vs Default vs BuyHold",
+                                   bt2=def_bt)
+                st.pyplot(fig3,use_container_width=True)
+
+        st.divider()
+        st.markdown('#### Optimized Parameters')
+        pcols=st.columns(3)
+        for i,(k,v) in enumerate(bp.items()):
+            dv=DEFAULT_PARAMS[k]
+            pcols[i%3].metric(k,str(v),f"default:{dv}" if v!=dv else 'unchanged')
+
+        a1,a2=st.columns(2)
+        with a1:
+            if st.button('Apply Optimized Parameters',type='primary',use_container_width=True):
+                st.session_state.update({'active_params':bp,'use_opt':True})
+                fetch_raw.clear()
+                raw=fetch_raw(st.session_state['code'],
+                              st.session_state['period'],
+                              st.session_state['interval'])
+                if raw is not None:
+                    dfo=compute_indicators(raw.copy())
+                    dfo=compute_signals(dfo,bp)
+                    st.session_state['result']={'df':dfo,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
+                st.rerun()
+        with a2:
+            if st.button('Reset to Default',use_container_width=True):
+                st.session_state.update({'active_params':DEFAULT_PARAMS,'use_opt':False})
+                fetch_raw.clear()
+                raw=fetch_raw(st.session_state['code'],
+                              st.session_state['period'],
+                              st.session_state['interval'])
+                if raw is not None:
+                    dfo=compute_indicators(raw.copy())
+                    dfo=compute_signals(dfo,DEFAULT_PARAMS)
+                    st.session_state['result']={'df':dfo,'at':datetime.now().strftime('%Y/%m/%d %H:%M:%S')}
+                st.rerun()
 
 with tab4:
     sd=df[df['sig']!=0].copy()
@@ -630,11 +736,6 @@ with tab4:
                      use_container_width=True,height=400)
     else:
         st.info('No signals. Try longer period.')
-
-with tab5:
-    sc=['Open','High','Low','Close','Volume','SMA25','SMA75','RSI','ADX','MACD','sig','trend']
-    dfs=df[[c for c in sc if c in df.columns]].tail(60).copy()
-    st.dataframe(dfs.style.format(precision=2),use_container_width=True,height=400)
 
 if st.session_state['auto_on'] and st.session_state['nxt']:
     rem=int(st.session_state['nxt']-time.time())
