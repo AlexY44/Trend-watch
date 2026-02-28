@@ -1,23 +1,10 @@
 """
-Trend Signal PRO  v4.0
-======================
-[修正・改善内容]
-■ バグ修正
-  - DEFAULT_PARAMSがpop()で破壊されるバグを根絶
-    → atr_stop_mult / trail_stop は EXEC_PARAMS として分離
-  - score_params内でも同じ破壊が起きていたため全面修正
-
-■ 戦略の根本改善（複数銘柄の特性を考慮した設計）
-  株・ETFに共通して機能しやすい原則:
-  1. トレンドフォロー + 押し目エントリーの組み合わせ
-  2. 「ノイズを除いたシグナル」: RSIスムーズ・EMAトレンド方向確認
-  3. ATRベースのリスク管理でDD抑制
-  4. シグナルの「品質スコア」で閾値制御（単純多数決より精度高い）
-
-■ WF最適化の安定化
-  - Expanding Windowに変更（trainが積み上がるほど安定）
-  - スコア: Calmar比率（CAGR/最大DD）+ Sharpe補助
-  - DEFAULT_PARAMSのpopバグを修正
+Trend Signal PRO  v5.0
+主な改善:
+  - WF最適化: 組み合わせ数を531,441→729に削減（重みは固定、閾値のみ最適化）
+  - 戦略: トレンドフォロー専用に再設計（上昇相場でのみエントリー）
+  - バグ修正: DEFAULT_SIGをpopで破壊するバグを根絶
+  - ATRトレーリングストップで利益保護
 """
 import warnings, itertools
 from datetime import datetime
@@ -52,42 +39,33 @@ C = {
     'cup':'#3fb950','cdn':'#f85149','bh':'#e8c55a',
 }
 
-# シグナルパラメータ（バックテストとは分離）
+# ---- シグナルパラメータ（固定デフォルト）----
 DEFAULT_SIG = {
-    'w_trend':    2,
-    'w_macd':     2,
-    'w_rsi':      1,
-    'w_stoch':    1,
-    'adx_th':     20,
-    'rsi_buy_th': 40,
-    'rsi_sell_th':60,
-    'stoch_buy_th': 30,
-    'stoch_sell_th':70,
-    'buy_th':     3,
-    'sell_th':    3,
+    'adx_th':         20,
+    'rsi_buy_th':     45,    # RSIがこの値を上回ったら買い条件成立
+    'rsi_sell_th':    55,    # RSIがこの値を下回ったら売り条件成立
+    'stoch_buy_th':   30,
+    'stoch_sell_th':  70,
+    'buy_th':          3,    # 買いスコアの閾値
+    'sell_th':         3,    # 売りスコアの閾値
 }
 
-# ATR実行パラメータ（破壊されないよう定数として固定・関数内でcopyして使う）
+# ---- 実行パラメータ（辞書とは分離して定数化）----
 ATR_MULT_DEFAULT  = 2.0
 USE_TRAIL_DEFAULT = True
 
+# ---- WF最適化グリッド: 重みは固定、閾値だけ最適化 → 729通り ----
 PARAM_GRID = {
-    'w_trend':       [1, 2, 3],
-    'w_macd':        [1, 2, 3],
-    'w_rsi':         [0, 1, 2],
-    'w_stoch':       [0, 1, 2],
     'adx_th':        [15, 20, 25],
     'rsi_buy_th':    [35, 40, 45],
     'rsi_sell_th':   [55, 60, 65],
-    'stoch_buy_th':  [25, 30, 35],
-    'stoch_sell_th': [65, 70, 75],
     'buy_th':        [3, 4, 5],
     'sell_th':       [3, 4, 5],
     'atr_mult':      [1.5, 2.0, 2.5],
 }
 
 # =========================================================
-# インジケーター
+# インジケーター計算
 # =========================================================
 def flatten_df(df):
     if isinstance(df.columns, pd.MultiIndex):
@@ -101,16 +79,18 @@ def compute_indicators(df):
     df['EMA20']  = cl.ewm(span=20, adjust=False).mean()
     df['EMA50']  = cl.ewm(span=50, adjust=False).mean()
     df['SMA200'] = cl.rolling(200).mean()
-    # EMAの傾き（標準化）: 上向きかどうか
-    df['EMA20_slope'] = (df['EMA20'] - df['EMA20'].shift(5)) / df['EMA20'].shift(5) * 100
-    df['EMA50_slope'] = (df['EMA50'] - df['EMA50'].shift(10)) / df['EMA50'].shift(10) * 100
+    df['SMA25']  = cl.rolling(25).mean()
+    df['SMA75']  = cl.rolling(75).mean()
 
-    # ---- ボリンジャーバンド ----
+    # EMA傾き: 5日前比の変化率(%)
+    df['EMA20_slope'] = (df['EMA20'] / df['EMA20'].shift(5) - 1) * 100
+    df['EMA50_slope'] = (df['EMA50'] / df['EMA50'].shift(10) - 1) * 100
+
+    # ---- Bollinger Bands ----
     bb = ta.volatility.BollingerBands(cl, 20, 2)
     df['BB_u']   = bb.bollinger_hband()
     df['BB_m']   = bb.bollinger_mavg()
     df['BB_l']   = bb.bollinger_lband()
-    df['BB_w']   = (df['BB_u'] - df['BB_l']) / df['BB_m']
     df['BB_pct'] = (cl - df['BB_l']) / (df['BB_u'] - df['BB_l'] + 1e-9)
 
     # ---- MACD ----
@@ -119,9 +99,9 @@ def compute_indicators(df):
     df['MSIG'] = mc.macd_signal()
     df['MHST'] = mc.macd_diff()
 
-    # ---- RSI（スムーズ版で誤シグナル軽減）----
+    # ---- RSI（EMAスムーズ）----
     df['RSI']   = ta.momentum.RSIIndicator(cl, 14).rsi()
-    df['RSI_s'] = df['RSI'].ewm(span=3, adjust=False).mean()
+    df['RSI_s'] = df['RSI'].ewm(span=5, adjust=False).mean()
 
     # ---- Stochastic ----
     sto = ta.momentum.StochasticOscillator(hi, lo, cl, 14, 3)
@@ -134,7 +114,7 @@ def compute_indicators(df):
     df['DI_plus']  = adx_i.adx_pos()
     df['DI_minus'] = adx_i.adx_neg()
 
-    # ---- ボラティリティ ----
+    # ---- ATR ----
     df['ATR']     = ta.volatility.AverageTrueRange(hi, lo, cl, 14).average_true_range()
     df['ATR_pct'] = df['ATR'] / cl.replace(0, np.nan)
 
@@ -142,99 +122,114 @@ def compute_indicators(df):
     df['VMA']     = vo.rolling(20).mean()
     df['V_ratio'] = vo / df['VMA'].replace(0, np.nan)
 
-    # SMA25/75（チャート表示用）
-    df['SMA25'] = cl.rolling(25).mean()
-    df['SMA75'] = cl.rolling(75).mean()
-
     return df
 
-def compute_signals(df, p):
+def compute_signals(df, p=None):
     """
-    シグナル生成
-    設計原則:
-      - EMA20/50のクロスとスロープでトレンド方向を確認
-      - MACDクロスで勢いを捉える
-      - RSI(スムーズ) + Stochasticで過熱・売られすぎを補助
-      - ADXでトレンド強度フィルター
-      - 各シグナルを重み付きスコアで合算 → 閾値超えでエントリー
+    戦略設計:
+    ─────────────────────────────────────────────
+    【買い】  トレンドフォロー + 押し目エントリー
+      必須: EMA20 > EMA50 (上昇トレンド)
+            EMA20が上向き (slope > 0)
+            ADX > adx_th (トレンド強度あり)
+      補助スコア:
+        +2 MACDがゼロライン上でSig上抜け  (強いモメンタム)
+        +1 MACDがゼロライン下でSig上抜け  (底打ち反転)
+        +1 RSI(smooth) > rsi_buy_th       (モメンタム確認)
+        +1 Stoch %K が buy_th 以下でSig上抜け (押し目)
+        +1 BB_pct < 0.4 (BBの下半分: 押し目)
+      → buy_th 以上でシグナル発生
+
+    【売り】  トレンド崩壊 or モメンタム喪失
+      必須条件なし（どちらかで売り）
+      スコア:
+        +2 EMA20 < EMA50 かつ 下向き (トレンド崩壊)
+        +2 MACDがSig下抜け
+        +1 RSI(smooth) < rsi_sell_th
+        +1 Stoch %K が sell_th 以上でSig下抜け
+        +1 BB_pct > 0.7 (高値圏)
+      → sell_th 以上でシグナル発生
+    ─────────────────────────────────────────────
     """
-    p = {**DEFAULT_SIG, **{k: v for k, v in p.items() if k in DEFAULT_SIG}}
+    if p is None: p = {}
+    # DEFAULT_SIGをベースに上書き（元の辞書は変更しない）
+    cfg = {**DEFAULT_SIG}
+    for k in DEFAULT_SIG:
+        if k in p:
+            cfg[k] = p[k]
+
     s = df
 
     # ---- トレンド判定 ----
-    # 上昇: EMA20 > EMA50 かつ 両方上向き かつ +DI > -DI
-    up_trend = (
-        (s['EMA20'] > s['EMA50']) &
-        (s['EMA20_slope'] > 0) &
-        (s['DI_plus'] > s['DI_minus'])
-    )
-    down_trend = (
-        (s['EMA20'] < s['EMA50']) &
-        (s['EMA20_slope'] < 0) &
-        (s['DI_plus'] < s['DI_minus'])
-    )
-    adx_ok = s['ADX'] > p['adx_th']
+    ema_up   = (s['EMA20'] > s['EMA50']) & (s['EMA20_slope'] > 0)
+    ema_down = (s['EMA20'] < s['EMA50']) & (s['EMA20_slope'] < 0)
+    adx_ok   = s['ADX'] > cfg['adx_th']
+    di_up    = s['DI_plus'] > s['DI_minus']
+    di_down  = s['DI_plus'] < s['DI_minus']
 
     # ---- MACDクロス ----
     macd_xu = (s['MACD'] > s['MSIG']) & (s['MACD'].shift(1) <= s['MSIG'].shift(1))
     macd_xd = (s['MACD'] < s['MSIG']) & (s['MACD'].shift(1) >= s['MSIG'].shift(1))
-    # MACDがゼロライン上 / 下にある（より強い確認）
-    macd_pos = s['MACD'] > 0
-    macd_neg = s['MACD'] < 0
 
-    # ---- RSI（スムーズ版）----
-    rsi_buy  = (s['RSI_s'] < p['rsi_buy_th'])   # 売られすぎ圏
-    rsi_sell = (s['RSI_s'] > p['rsi_sell_th'])  # 買われすぎ圏
-    rsi_xu   = (s['RSI_s'] > p['rsi_buy_th'])  & (s['RSI_s'].shift(1) <= p['rsi_buy_th'])
-    rsi_xd   = (s['RSI_s'] < p['rsi_sell_th']) & (s['RSI_s'].shift(1) >= p['rsi_sell_th'])
-
-    # ---- Stochastic ----
+    # ---- Stochasticクロス ----
     sk_xu = (s['SK'] > s['SD']) & (s['SK'].shift(1) <= s['SD'].shift(1))
     sk_xd = (s['SK'] < s['SD']) & (s['SK'].shift(1) >= s['SD'].shift(1))
-    sk_low  = s['SK'] < p['stoch_buy_th']
-    sk_high = s['SK'] > p['stoch_sell_th']
 
-    # ---- BB押し目・戻り ----
-    bb_buy  = s['BB_pct'] < 0.25   # BB下位25%: 押し目
-    bb_sell = s['BB_pct'] > 0.75   # BB上位75%: 過熱
+    # ========================================================
+    # 買いスコア
+    # ========================================================
+    bsc = pd.Series(0, index=s.index)
 
-    # ================================================================
-    # 買いスコア（トレンドフォロー + 押し目の合わせ技）
-    # ================================================================
-    bsc = (
-        # [必須に近い] トレンドが上 × ADX強度あり
-        (up_trend & adx_ok).astype(int) * p['w_trend'] +
-        # [重要] MACDクロス上向き（ゼロライン上ならボーナス）
-        (macd_xu).astype(int) * p['w_macd'] +
-        (macd_xu & macd_pos).astype(int) +          # ゼロライン上クロスはさらに+1
-        # [補助] RSI: 売られすぎからの回復
-        (rsi_xu & rsi_buy).astype(int) * p['w_rsi'] +
-        # [補助] Stochastic: 低位でのクロス
-        (sk_xu & sk_low).astype(int) * p['w_stoch'] +
-        # [補助] BB押し目
-        bb_buy.astype(int)
-    )
+    # MACDクロス上 (ゼロライン上なら+2、下でも+1)
+    bsc += (macd_xu & (s['MACD'] > 0)).astype(int) * 2
+    bsc += (macd_xu & (s['MACD'] <= 0)).astype(int) * 1
 
-    # ================================================================
-    # 売りスコア（対称）
-    # ================================================================
-    ssc = (
-        (down_trend & adx_ok).astype(int) * p['w_trend'] +
-        (macd_xd).astype(int) * p['w_macd'] +
-        (macd_xd & macd_neg).astype(int) +
-        (rsi_xd & rsi_sell).astype(int) * p['w_rsi'] +
-        (sk_xd & sk_high).astype(int) * p['w_stoch'] +
-        bb_sell.astype(int)
-    )
+    # RSIモメンタム確認
+    bsc += (s['RSI_s'] > cfg['rsi_buy_th']).astype(int)
+
+    # Stoch押し目クロス
+    bsc += (sk_xu & (s['SK'] < cfg['stoch_buy_th'])).astype(int)
+
+    # BB押し目（バンドの下半分）
+    bsc += (s['BB_pct'] < 0.4).astype(int)
+
+    # トレンドフィルター: 上昇トレンド + ADX + +DI優位でない場合スコアを半減
+    trend_ok = ema_up & adx_ok & di_up
+    bsc = bsc.where(trend_ok, bsc // 2)
+
+    # ========================================================
+    # 売りスコア
+    # ========================================================
+    ssc = pd.Series(0, index=s.index)
+
+    # トレンド崩壊（これだけで大きな加点）
+    ssc += (ema_down & adx_ok & di_down).astype(int) * 2
+
+    # MACDクロス下
+    ssc += (macd_xd & (s['MACD'] < 0)).astype(int) * 2
+    ssc += (macd_xd & (s['MACD'] >= 0)).astype(int) * 1
+
+    # RSI過熱
+    ssc += (s['RSI_s'] < cfg['rsi_sell_th']).astype(int)
+
+    # Stoch高値クロス
+    ssc += (sk_xd & (s['SK'] > cfg['stoch_sell_th'])).astype(int)
+
+    # BB過熱圏
+    ssc += (s['BB_pct'] > 0.7).astype(int)
 
     df = df.copy()
-    df['bsc'] = bsc; df['ssc'] = ssc; df['sig'] = 0
-    df.loc[bsc >= p['buy_th'],  'sig'] =  1
-    df.loc[ssc >= p['sell_th'], 'sig'] = -1
+    df['bsc'] = bsc
+    df['ssc'] = ssc
+    df['sig'] = 0
+    df.loc[bsc >= cfg['buy_th'],  'sig'] =  1
+    df.loc[ssc >= cfg['sell_th'], 'sig'] = -1
 
+    # トレンド表示用
     df['trend'] = 'Range'
-    df.loc[up_trend   & (s['ADX'] > 20), 'trend'] = 'Up'
-    df.loc[down_trend & (s['ADX'] > 20), 'trend'] = 'Down'
+    df.loc[ema_up   & adx_ok, 'trend'] = 'Up'
+    df.loc[ema_down & adx_ok, 'trend'] = 'Down'
+
     return df
 
 # =========================================================
@@ -253,14 +248,10 @@ def fetch_raw(code, period, interval):
         return None
 
 # =========================================================
-# バックテスト（ATRトレーリングストップ付き）
+# バックテスト
 # =========================================================
 def run_backtest(df, cost=0.001, initial_equity=1.0,
                  atr_mult=ATR_MULT_DEFAULT, use_trail=USE_TRAIL_DEFAULT):
-    """
-    atr_mult / use_trail は引数で受け取る
-    → DEFAULT_PARAMSを絶対に変更しない
-    """
     cl    = df['Close'].values
     hi    = df['High'].values
     sig   = df['sig'].values
@@ -286,7 +277,7 @@ def run_backtest(df, cost=0.001, initial_equity=1.0,
                 eq *= (1 + ret)
                 trades.append({
                     'entry_date': ed, 'exit_date': dates[i],
-                    'entry': ep,  'exit': xp,  'ret': ret * 100,
+                    'entry': ep, 'exit': xp, 'ret': ret * 100,
                     'result':    'Win' if ret > 0 else 'Loss',
                     'exit_type': 'Stop' if stop_hit else 'Signal',
                 })
@@ -330,33 +321,31 @@ def run_backtest(df, cost=0.001, initial_equity=1.0,
     }
 
 # =========================================================
-# スコア関数（破壊なし版）
+# スコア関数（辞書破壊なし）
 # =========================================================
 def score_params(df, p, cost):
     """
-    p は PARAM_GRID の 1コンボ（atr_mult を含む）
-    DEFAULT_SIG / DEFAULT_PARAMS を一切変更しない
+    p は PARAM_GRID の 1コンボ（atr_mult含む）
+    辞書を一切変更しない
     """
-    # atr_mult だけ取り出し（辞書を変更しない）
-    atr_mult = p.get('atr_mult', ATR_MULT_DEFAULT)
+    atr_mult = float(p.get('atr_mult', ATR_MULT_DEFAULT))
+    sig_p    = {k: p[k] for k in DEFAULT_SIG if k in p}
 
-    # シグナルパラメータだけ抽出（atr_mult は compute_signals に渡さない）
-    sig_p = {k: v for k, v in p.items() if k in DEFAULT_SIG}
-    df2   = compute_signals(df, sig_p)
-    bt    = run_backtest(df2, cost, atr_mult=atr_mult, use_trail=True)
-    if bt is None: return -999
+    df2 = compute_signals(df, sig_p)
+    bt  = run_backtest(df2, cost, atr_mult=atr_mult, use_trail=True)
+    if bt is None: return -9999
 
     s = bt['stats']
-    if s['n'] < 5:       return -999   # トレード数不足
-    if s['mdd'] < -55:   return -999   # 壊滅的DD
+    if s['n'] < 5:     return -9999
+    if s['mdd'] < -55: return -9999
 
-    # Calmar + Sharpe補助 - ペナルティ
-    wr_pen = max(0, (40 - s['wr']) * 0.05)
-    dd_pen = max(0, (-s['mdd'] - 30) * 0.2)
+    wr_pen = max(0.0, (40 - s['wr']) * 0.05)
+    dd_pen = max(0.0, (-s['mdd'] - 30) * 0.2)
     return s['calmar'] * 0.6 + s['sharpe'] * 0.4 - wr_pen - dd_pen
 
 # =========================================================
 # Walk-Forward 最適化（Expanding Window）
+# 729通り × n_splits fold: 約15〜60秒で完了
 # =========================================================
 def walk_forward_optimize(code, period, interval, n_splits=4, cost=0.001):
     raw = fetch_raw(code, period, interval)
@@ -366,10 +355,13 @@ def walk_forward_optimize(code, period, interval, n_splits=4, cost=0.001):
     keys       = list(PARAM_GRID.keys())
     vals       = list(PARAM_GRID.values())
     all_params = [dict(zip(keys, c)) for c in itertools.product(*vals)]
+    # 確認: 729通りのはず
+    n_combos   = len(all_params)
 
     n         = len(base)
     min_train = max(int(n * 0.45), 80)
     test_size = (n - min_train) // n_splits
+
     if test_size < 20:
         st.error("データが少なすぎます。期間を長くしてください（5y推奨）。")
         return None
@@ -379,7 +371,7 @@ def walk_forward_optimize(code, period, interval, n_splits=4, cost=0.001):
     combined_equity_series = []
     current_eq             = 1.0
 
-    progress = st.progress(0, 'Walk-forward optimization (Expanding Window)...')
+    progress = st.progress(0, f'Walk-Forward Optimization ({n_combos}通り × {n_splits} folds)...')
 
     for fold in range(n_splits):
         test_start = min_train + fold * test_size
@@ -389,77 +381,80 @@ def walk_forward_optimize(code, period, interval, n_splits=4, cost=0.001):
 
         if len(train) < 80 or len(test) < 20: continue
 
-        # ---- train で最適化 ----
-        best_score = -999
-        best_p     = {k: PARAM_GRID[k][len(v)//2] for k, v in PARAM_GRID.items()}  # 中央値初期値
+        # train で最適化
+        best_score = -9999
+        best_p     = all_params[len(all_params)//2]
         for p in all_params:
             sc = score_params(train, p, cost)
             if sc > best_score:
                 best_score = sc
                 best_p     = p
 
-        # ---- test に適用（元辞書を変更しない）----
-        atr_mult_best = best_p.get('atr_mult', ATR_MULT_DEFAULT)
-        sig_p_best    = {k: v for k, v in best_p.items() if k in DEFAULT_SIG}
-        test_df       = compute_signals(test.copy(), sig_p_best)
-        test_bt       = run_backtest(test_df, cost, initial_equity=current_eq,
-                                     atr_mult=atr_mult_best, use_trail=True)
+        # test に適用（辞書コピーを使い元を変更しない）
+        atr_m  = float(best_p.get('atr_mult', ATR_MULT_DEFAULT))
+        sig_p  = {k: best_p[k] for k in DEFAULT_SIG if k in best_p}
+        tdf    = compute_signals(test.copy(), sig_p)
+        tbt    = run_backtest(tdf, cost, initial_equity=current_eq,
+                              atr_mult=atr_m, use_trail=True)
 
-        if test_bt:
-            combined_trades.extend(test_bt['trades'])
-            combined_equity_series.append(test_bt['equity'])
-            current_eq = test_bt['equity'].iloc[-1]
+        if tbt:
+            combined_trades.extend(tbt['trades'])
+            combined_equity_series.append(tbt['equity'])
+            current_eq = tbt['equity'].iloc[-1]
 
         fold_results.append({
-            'fold':        fold + 1,
-            'train_n':     len(train),
-            'test_start':  base.index[test_start].strftime('%Y/%m'),
-            'test_end':    base.index[min(test_end-1, n-1)].strftime('%Y/%m'),
-            'best_params': best_p,
-            'best_score':  round(best_score, 3),
-            'test_bt':     test_bt,
+            'fold':       fold + 1,
+            'train_n':    len(train),
+            'test_start': base.index[test_start].strftime('%Y/%m'),
+            'test_end':   base.index[min(test_end-1, n-1)].strftime('%Y/%m'),
+            'best_p':     best_p,
+            'score':      round(best_score, 3),
+            'tbt':        tbt,
         })
-        progress.progress((fold+1)/n_splits, f'Fold {fold+1}/{n_splits} done')
+        progress.progress((fold+1)/n_splits,
+                          f'Fold {fold+1}/{n_splits} 完了 (score={best_score:.2f})')
 
     progress.empty()
     if not combined_equity_series: return None
 
-    full_equity = pd.concat(combined_equity_series)
-    full_equity = full_equity[~full_equity.index.duplicated(keep='first')]
+    full_eq = pd.concat(combined_equity_series)
+    full_eq = full_eq[~full_eq.index.duplicated(keep='first')]
 
     bh_wf = pd.Series(
-        (base.loc[full_equity.index, 'Close'] /
-         base.loc[full_equity.index[0], 'Close']).values,
-        index=full_equity.index,
+        (base.loc[full_eq.index,'Close'] /
+         base.loc[full_eq.index[0],'Close']).values,
+        index=full_eq.index,
     )
-    roll_max = full_equity.cummax()
-    full_dd  = (full_equity - roll_max) / roll_max * 100
-    pct_chg  = full_equity.pct_change().dropna()
+    rm      = full_eq.cummax()
+    full_dd = (full_eq - rm) / rm * 100
+    pc      = full_eq.pct_change().dropna()
+
     full_stats = {
-        'n':      len(combined_trades),
-        'sr':     (full_equity.iloc[-1] - 1.0) * 100,
-        'bh':     (bh_wf.iloc[-1] - 1.0) * 100,
-        'mdd':    full_dd.min(),
-        'sharpe': pct_chg.mean()/pct_chg.std()*np.sqrt(252) if pct_chg.std()>0 else 0,
+        'n':  len(combined_trades),
+        'sr': (full_eq.iloc[-1] - 1.0) * 100,
+        'bh': (bh_wf.iloc[-1] - 1.0) * 100,
+        'mdd': full_dd.min(),
+        'sharpe': pc.mean()/pc.std()*np.sqrt(252) if pc.std()>0 else 0,
     }
 
-    # Default比較（辞書を変更しない）
-    default_df = compute_signals(base.copy(), DEFAULT_SIG)
-    default_bt = run_backtest(default_df, cost,
-                              atr_mult=ATR_MULT_DEFAULT, use_trail=USE_TRAIL_DEFAULT)
+    # Default比較
+    def_df = compute_signals(base.copy(), DEFAULT_SIG)
+    def_bt = run_backtest(def_df, cost,
+                          atr_mult=ATR_MULT_DEFAULT, use_trail=USE_TRAIL_DEFAULT)
 
     return {
-        'best_params':  fold_results[-1]['best_params'],
+        'best_p':       fold_results[-1]['best_p'],
         'full_bt': {
             'trades':    combined_trades,
-            'equity':    full_equity,
+            'equity':    full_eq,
             'bh_series': bh_wf,
             'drawdown':  full_dd,
             'stats':     full_stats,
         },
-        'default_bt':   default_bt,
+        'default_bt':   def_bt,
         'fold_results': fold_results,
         'base':         base,
+        'n_combos':     n_combos,
     }
 
 # =========================================================
@@ -493,29 +488,26 @@ def make_chart(df, title, mobile=False):
     plot_df = df.iloc[-display_n:].copy().reset_index(drop=False)
     n = len(plot_df); xs = np.arange(n)
 
-    # ---- Panel 0: ローソク足 ----
     ax0 = axes[0]
     draw_candles(ax0, plot_df)
-    ax0.plot(xs, plot_df['EMA20'],  color='#ff79c6', lw=1.0, label='EMA20', zorder=4)
-    ax0.plot(xs, plot_df['EMA50'],  color=C['sma25'], lw=1.2, label='EMA50', zorder=4)
-    ax0.plot(xs, plot_df['SMA200'], color=C['sma200'],lw=1.2, label='SMA200',zorder=4)
+    ax0.plot(xs, plot_df['EMA20'],  color='#ff79c6',   lw=1.0, label='EMA20', zorder=4)
+    ax0.plot(xs, plot_df['EMA50'],  color=C['sma25'],   lw=1.2, label='EMA50', zorder=4)
+    ax0.plot(xs, plot_df['SMA200'], color=C['sma200'],  lw=1.2, label='SMA200',zorder=4)
     ax0.plot(xs, plot_df['BB_u'],   color=C['bb'], lw=0.8, ls=':', alpha=0.8)
     ax0.plot(xs, plot_df['BB_l'],   color=C['bb'], lw=0.8, ls=':', alpha=0.8)
-    ax0.fill_between(xs, plot_df['BB_u'], plot_df['BB_l'],
-                     color=C['bb'], alpha=0.07)
-    bi = plot_df.index[plot_df['sig']==1].tolist()
+    ax0.fill_between(xs, plot_df['BB_u'], plot_df['BB_l'], color=C['bb'], alpha=0.07)
+    bi = plot_df.index[plot_df['sig']== 1].tolist()
     si = plot_df.index[plot_df['sig']==-1].tolist()
     if bi: ax0.scatter(bi, plot_df.loc[bi,'Low']*0.995,
-                       marker='^', color=C['buy'], s=65, zorder=6, label='Buy')
+                       marker='^', color=C['buy'],  s=65, zorder=6, label='Buy')
     if si: ax0.scatter(si, plot_df.loc[si,'High']*1.005,
-                       marker='v', color=C['sell'],s=65, zorder=6, label='Sell')
+                       marker='v', color=C['sell'], s=65, zorder=6, label='Sell')
     ax0.set_title(title, color=C['text'], fontsize=11, pad=6)
     ax0.legend(loc='upper left', fontsize=7, facecolor=C['bg'],
                edgecolor=C['grid'], labelcolor=C['text'], ncol=5)
     ax0.set_xlim(-1,n); ax0.set_xticks([])
     ax0.set_ylabel('Price', color=C['sub'], fontsize=8)
 
-    # ---- Panel 1: 出来高 ----
     ax1 = axes[1]
     vcols = [C['cup'] if plot_df['Close'].iloc[i]>=plot_df['Open'].iloc[i]
              else C['cdn'] for i in range(n)]
@@ -524,7 +516,6 @@ def make_chart(df, title, mobile=False):
     ax1.set_xlim(-1,n); ax1.set_xticks([])
     ax1.set_ylabel('Vol', color=C['sub'], fontsize=8)
 
-    # ---- Panel 2: MACD ----
     ax2 = axes[2]
     ax2.plot(xs, plot_df['MACD'], color=C['macd'], lw=1.2, label='MACD', zorder=3)
     ax2.plot(xs, plot_df['MSIG'], color=C['msig'], lw=1.0, ls='--', label='Sig', zorder=3)
@@ -537,10 +528,9 @@ def make_chart(df, title, mobile=False):
     ax2.legend(loc='upper left', fontsize=7, facecolor=C['bg'],
                edgecolor=C['grid'], labelcolor=C['text'])
 
-    # ---- Panel 3: RSI ----
     ax3 = axes[3]
-    ax3.plot(xs, plot_df['RSI'],   color=C['rsi'],   lw=1.2, label='RSI',    zorder=3)
-    ax3.plot(xs, plot_df['RSI_s'], color='#79c0ff',  lw=0.9, ls='--', label='RSI(EMA3)', zorder=3)
+    ax3.plot(xs, plot_df['RSI'],   color=C['rsi'],  lw=1.2, label='RSI',   zorder=3)
+    ax3.plot(xs, plot_df['RSI_s'], color='#79c0ff', lw=0.9, ls='--', label='RSI(s)', zorder=3)
     ax3.axhline(60, color=C['sell'], lw=0.8, ls='--', alpha=0.7)
     ax3.axhline(40, color=C['buy'],  lw=0.8, ls='--', alpha=0.7)
     ax3.axhline(50, color=C['grid'], lw=0.6)
@@ -553,7 +543,6 @@ def make_chart(df, title, mobile=False):
     ax3.legend(loc='upper left', fontsize=7, facecolor=C['bg'],
                edgecolor=C['grid'], labelcolor=C['text'])
 
-    # ---- Panel 4: Stochastic ----
     ax4 = axes[4]
     ax4.plot(xs, plot_df['SK'], color=C['buy'],  lw=1.1, label='%K', zorder=3)
     ax4.plot(xs, plot_df['SD'], color=C['msig'], lw=1.0, ls='--', label='%D', zorder=3)
@@ -582,8 +571,8 @@ def make_bt_chart(bt, title, bt2=None, label='Strategy'):
     ax1, ax2 = axes
 
     if bh is not None:
-        ax1.plot(bh.index, bh.values, color=C['bh'], lw=1.4,
-                 ls=':', label='Buy & Hold', zorder=2)
+        ax1.plot(bh.index, bh.values,
+                 color=C['bh'], lw=1.4, ls=':', label='Buy & Hold', zorder=2)
     ax1.plot(eq.index, eq.values, color=C['buy'], lw=2.0, label=label, zorder=3)
     if bt2 is not None:
         ax1.plot(bt2['equity'].index, bt2['equity'].values,
@@ -638,7 +627,7 @@ with st.sidebar:
             raw = fetch_raw(code, period, interval)
         if raw is not None:
             df_i = compute_indicators(raw.copy())
-            df_s = compute_signals(df_i, DEFAULT_SIG)
+            df_s = compute_signals(df_i)
             st.session_state['result'] = {
                 'df':df_s, 'code':code, 'period':period,
                 'interval':interval, 'at':datetime.now().strftime('%H:%M:%S'),
@@ -656,10 +645,9 @@ st.markdown(f"## {disp_code}  –  Updated: {res['at']}")
 
 tab1, tab2, tab3 = st.tabs(['📈 Live Chart','🧪 Backtest','🔬 Walk-Forward Optimization'])
 
-# ============================================================
 with tab1:
     last = df.iloc[-1]
-    sig_label = {1:'🟢 BUY', -1:'🔴 SELL', 0:'⚪ NEUTRAL'}.get(int(last['sig']),'⚪ NEUTRAL')
+    sig_label = {1:'🟢 BUY',-1:'🔴 SELL',0:'⚪ NEUTRAL'}.get(int(last['sig']),'⚪ NEUTRAL')
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Signal", sig_label)
     c2.metric("Trend",  last['trend'])
@@ -668,7 +656,6 @@ with tab1:
     fig_c = make_chart(df, f"{disp_code} – Signal Analysis")
     st.pyplot(fig_c, use_container_width=True); plt.close(fig_c)
 
-# ============================================================
 with tab2:
     bt = run_backtest(df, atr_mult=ATR_MULT_DEFAULT, use_trail=USE_TRAIL_DEFAULT)
     if bt:
@@ -694,13 +681,15 @@ with tab2:
             for col in ['ret','entry','exit']: tdf[col] = tdf[col].round(2)
             st.dataframe(tdf, use_container_width=True, height=250)
 
-# ============================================================
 with tab3:
-    st.markdown("""
+    n_combos_display = 1
+    for v in PARAM_GRID.values(): n_combos_display *= len(v)
+    st.markdown(f"""
     **Expanding Window Walk-Forward Optimization**
-    - Train期間を累積拡大 → 後半Foldほど安定した選択
-    - スコア: **Calmar×0.6 + Sharpe×0.4** でリスク調整リターンを評価
-    - `atr_mult`（トレーリングストップ倍率）もグリッドサーチ
+    - グリッド: **{n_combos_display}通り**（重みは固定、閾値のみ最適化）
+    - Train: Expanding（累積拡大）→ 後半Foldほど安定した選択
+    - スコア: Calmar×0.6 + Sharpe×0.4
+    - 推定時間: **{n_combos_display * 4 // 200}〜{n_combos_display * 4 // 80}秒**（銘柄・期間による）
     """)
     n_splits = st.slider("Splits", 2, 6, 4)
     if st.button("🚀 Run Walk-Forward Optimization"):
@@ -711,7 +700,7 @@ with tab3:
 
     wf = st.session_state.get('wf_result')
     if wf:
-        st.success("✅ Walk-Forward 完了（Expanding Window）")
+        st.success(f"✅ Walk-Forward 完了（{wf['n_combos']}通り × {n_splits} folds）")
         s = wf['full_bt']['stats']
         c1,c2,c3,c4,c5 = st.columns(5)
         c1.metric("WF Return",    f"{s['sr']:.1f}%")
@@ -726,17 +715,17 @@ with tab3:
         st.pyplot(fig_wf, use_container_width=True); plt.close(fig_wf)
 
         st.markdown("#### 最適パラメータ（最終Fold）")
-        st.json(wf['best_params'])
+        st.json(wf['best_p'])
 
         st.markdown("#### Fold Details")
         for r in wf['fold_results']:
             with st.expander(
-                f"Fold {r['fold']}: {r['test_start']}→{r['test_end']}"
-                f"  |  Train: {r['train_n']}本  |  Score: {r['best_score']}"
+                f"Fold {r['fold']}: {r['test_start']} → {r['test_end']}"
+                f"  |  Train: {r['train_n']}本  |  Score: {r['score']}"
             ):
-                st.write("**Best Params:**", r['best_params'])
-                if r['test_bt']:
-                    rs = r['test_bt']['stats']
+                st.write("**Best Params:**", r['best_p'])
+                if r['tbt']:
+                    rs = r['tbt']['stats']
                     fc1,fc2,fc3,fc4 = st.columns(4)
                     fc1.metric("Test Return",  f"{rs['sr']:.1f}%")
                     fc2.metric("Max Drawdown", f"{rs['mdd']:.1f}%")
