@@ -43,6 +43,8 @@ PARAM_GRID = {
     'rsi_buy_th': [25, 30, 35],
     'rsi_sell_th': [65, 70, 75],
     'adx_th': [20, 25],
+    'stoch_buy_th': [20, 25, 30],
+    'stoch_sell_th': [70, 75, 80],
     'buy_th': [2, 3, 4],
     'sell_th': [2, 3, 4],
 }
@@ -157,11 +159,13 @@ def run_backtest(df, cost=0.001, initial_equity=1.0):
                       'sr': (eq / initial_equity - 1) * 100, 'bh': bh, 'mdd': mdd, 'cagr': cagr, 'sharpe': sharpe}}
 
 def score_params(df, p, cost):
-    df2 = compute_signals(df, p)
+    # DEFAULT_PARAMSをベースにマージ → PARAM_GRIDに不足キーがあってもKeyErrorにならない
+    full_p = {**DEFAULT_PARAMS, **p}
+    df2 = compute_signals(df, full_p)
     bt = run_backtest(df2, cost)
-    if bt is None or bt['stats']['n'] < 2: return -999
-    s = bt['stats']
-    return s['sr'] - max(0, -s['mdd']) * 0.5 + s['sharpe'] * 3
+    if bt is None or bt["stats"]["n"] < 2: return -999
+    s = bt["stats"]
+    return s["sr"] - max(0, -s["mdd"]) * 0.5 + s["sharpe"] * 3
 
 # --- ウォークフォワード最適化 ---
 @st.cache_data(ttl=300, show_spinner=False)
