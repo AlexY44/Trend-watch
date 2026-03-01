@@ -1,7 +1,6 @@
+yfinance
+ta
+pandas
+numpy
+matplotlib
 
-yfinance>=0.2.36
-pandas>=2.0.0
-numpy>=1.26.0
-matplotlib>=3.8.0
-ta>=0.11.0
-pyarrow>=14.0.0
